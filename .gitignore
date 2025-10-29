@@ -1,0 +1,54 @@
+# Ambiente virtual Python
+.venv/
+venv/
+ENV/
+
+# Arquivos de byte-code Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Arquivos de distribuição/packaging
+dist/
+build/
+*.egg-info/
+
+# Arquivos de base de dados vetorial e embeddings
+*.faiss
+*.pkl
+*.bin
+vector_store/
+chroma/
+.chroma/
+
+# Arquivos de ambiente e configuração
+.env
+.env.local
+*.cfg
+config.py
+
+# Logs e arquivos temporários
+*.log
+*.tmp
+.DS_Store
+
+# Arquivos de IDE/editores
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb
+
+# Arquivos de cache
+.cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Arquivos específicos do projeto
+# Mantenha a pasta base/ com os PDFs no git se necessário
+# base/
