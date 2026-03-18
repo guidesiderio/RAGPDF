@@ -18,7 +18,7 @@ load_dotenv()
 BASE_DIR = Path("base")
 DB_DIR = Path("db")
 COLLECTION_NAME = "ragpdf"
-EMBEDDING_MODEL = "models/embedding-001"
+EMBEDDING_MODEL = "models/gemini-embedding-001"
 CHAT_MODEL = "gemini-1.5-flash"
 CHUNK_SIZE = 2000
 CHUNK_OVERLAP = 500
