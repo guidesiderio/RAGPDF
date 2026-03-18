@@ -17,6 +17,7 @@ load_dotenv()
 
 BASE_DIR = Path("base")
 DB_DIR = Path("db")
+COLLECTION_NAME = "ragpdf"
 EMBEDDING_MODEL = "models/embedding-001"
 CHAT_MODEL = "gemini-1.5-flash"
 CHUNK_SIZE = 2000
@@ -26,6 +27,13 @@ DEFAULT_K = 4
 
 class RAGPDFError(Exception):
     """Erro esperado da aplicação."""
+
+
+@dataclass(frozen=True)
+class IndexedChunk:
+    chunk_id: str
+    text: str
+    metadata: dict
 
 
 @dataclass(frozen=True)
@@ -82,50 +90,107 @@ def ensure_vector_db_exists(db_dir: Path = DB_DIR) -> None:
         )
 
 
-def _load_langchain_components():
+def _load_runtime_dependencies():
     try:
-        from langchain_chroma import Chroma
-        from langchain_community.document_loaders import PyPDFDirectoryLoader
-        from langchain_google_genai import (
-            ChatGoogleGenerativeAI,
-            GoogleGenerativeAIEmbeddings,
-        )
-        from langchain_text_splitters import RecursiveCharacterTextSplitter
+        import chromadb
+        import google.generativeai as genai
+        from pypdf import PdfReader
     except ImportError as exc:
         raise RAGPDFError(
             "Dependências do RAG não estão instaladas. Rode 'pip install -r requirements.txt'."
         ) from exc
 
-    return Chroma, PyPDFDirectoryLoader, ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings, RecursiveCharacterTextSplitter
+    return chromadb, genai, PdfReader
 
 
-def load_documents(base_dir: Path = BASE_DIR):
+def _configure_genai():
+    _, genai, _ = _load_runtime_dependencies()
+    genai.configure(api_key=get_google_api_key())
+    return genai
+
+
+def _get_chroma_collection(db_dir: Path = DB_DIR):
+    chromadb, _, _ = _load_runtime_dependencies()
+    client = chromadb.PersistentClient(path=str(db_dir))
+    return client.get_or_create_collection(name=COLLECTION_NAME)
+
+
+def load_documents(base_dir: Path = BASE_DIR) -> list[dict]:
     ensure_base_dir(base_dir)
-    _, PyPDFDirectoryLoader, _, _, _ = _load_langchain_components()
-    loader = PyPDFDirectoryLoader(str(base_dir), glob="**/*.pdf")
-    return loader.load()
+    _, _, PdfReader = _load_runtime_dependencies()
+
+    documents: list[dict] = []
+    for pdf_path in sorted(base_dir.rglob("*.pdf")):
+        reader = PdfReader(str(pdf_path))
+        for page_number, page in enumerate(reader.pages, start=1):
+            text = (page.extract_text() or "").strip()
+            if not text:
+                continue
+            documents.append(
+                {
+                    "source": pdf_path.name,
+                    "path": str(pdf_path),
+                    "page": page_number,
+                    "text": text,
+                }
+            )
+    return documents
 
 
-def split_documents(documents: list, chunk_size: int = CHUNK_SIZE, chunk_overlap: int = CHUNK_OVERLAP):
-    _, _, _, _, RecursiveCharacterTextSplitter = _load_langchain_components()
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        length_function=len,
-        add_start_index=True,
-    )
-    chunks = splitter.split_documents(documents)
-    for index, chunk in enumerate(chunks):
-        chunk.metadata["chunk_index"] = index
+def _split_text(text: str, chunk_size: int = CHUNK_SIZE, chunk_overlap: int = CHUNK_OVERLAP) -> list[str]:
+    cleaned = " ".join(text.split())
+    if not cleaned:
+        return []
+
+    chunks: list[str] = []
+    start = 0
+    step = max(chunk_size - chunk_overlap, 1)
+    while start < len(cleaned):
+        end = min(start + chunk_size, len(cleaned))
+        chunks.append(cleaned[start:end])
+        if end >= len(cleaned):
+            break
+        start += step
     return chunks
 
 
-def build_embeddings():
-    _, _, _, GoogleGenerativeAIEmbeddings, _ = _load_langchain_components()
-    return GoogleGenerativeAIEmbeddings(
-        model=EMBEDDING_MODEL,
-        google_api_key=get_google_api_key(),
-    )
+def split_documents(
+    documents: list[dict], chunk_size: int = CHUNK_SIZE, chunk_overlap: int = CHUNK_OVERLAP
+) -> list[IndexedChunk]:
+    chunks: list[IndexedChunk] = []
+    chunk_counter = 0
+    for document_index, document in enumerate(documents):
+        text_chunks = _split_text(document["text"], chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+        for local_chunk_index, chunk_text in enumerate(text_chunks):
+            chunks.append(
+                IndexedChunk(
+                    chunk_id=f"{document_index}-{local_chunk_index}",
+                    text=chunk_text,
+                    metadata={
+                        "source": document["source"],
+                        "path": document["path"],
+                        "page": document["page"],
+                        "chunk_index": chunk_counter,
+                    },
+                )
+            )
+            chunk_counter += 1
+    return chunks
+
+
+def _embed_texts(texts: list[str]) -> list[list[float]]:
+    genai = _configure_genai()
+    embeddings: list[list[float]] = []
+    for text in texts:
+        response = genai.embed_content(model=EMBEDDING_MODEL, content=text, task_type="retrieval_document")
+        embeddings.append(response["embedding"])
+    return embeddings
+
+
+def _embed_query(text: str) -> list[float]:
+    genai = _configure_genai()
+    response = genai.embed_content(model=EMBEDDING_MODEL, content=text, task_type="retrieval_query")
+    return response["embedding"]
 
 
 def reset_vector_db(db_dir: Path = DB_DIR) -> None:
@@ -136,15 +201,18 @@ def reset_vector_db(db_dir: Path = DB_DIR) -> None:
 def index_documents(base_dir: Path = BASE_DIR, db_dir: Path = DB_DIR) -> IndexResult:
     documents = load_documents(base_dir)
     chunks = split_documents(documents)
+    if not chunks:
+        raise RAGPDFError("Os PDFs foram lidos, mas nenhum texto utilizável foi extraído para indexação.")
 
     reset_vector_db(db_dir)
     db_dir.mkdir(parents=True, exist_ok=True)
 
-    Chroma, _, _, _, _ = _load_langchain_components()
-    Chroma.from_documents(
-        documents=chunks,
-        embedding=build_embeddings(),
-        persist_directory=str(db_dir),
+    collection = _get_chroma_collection(db_dir)
+    collection.add(
+        ids=[chunk.chunk_id for chunk in chunks],
+        documents=[chunk.text for chunk in chunks],
+        metadatas=[chunk.metadata for chunk in chunks],
+        embeddings=_embed_texts([chunk.text for chunk in chunks]),
     )
 
     return IndexResult(
@@ -154,29 +222,35 @@ def index_documents(base_dir: Path = BASE_DIR, db_dir: Path = DB_DIR) -> IndexRe
     )
 
 
-def load_vector_store(db_dir: Path = DB_DIR):
+def retrieve_context(question: str, db_dir: Path = DB_DIR, k: int = DEFAULT_K) -> list[dict]:
     ensure_vector_db_exists(db_dir)
-    Chroma, _, _, _, _ = _load_langchain_components()
-    return Chroma(
-        persist_directory=str(db_dir),
-        embedding_function=build_embeddings(),
+    collection = _get_chroma_collection(db_dir)
+    results = collection.query(
+        query_embeddings=[_embed_query(question)],
+        n_results=k,
+        include=["documents", "metadatas", "distances"],
     )
 
+    documents = results.get("documents", [[]])[0]
+    metadatas = results.get("metadatas", [[]])[0]
+    distances = results.get("distances", [[]])[0]
 
-def retrieve_context(question: str, db_dir: Path = DB_DIR, k: int = DEFAULT_K):
-    vector_store = load_vector_store(db_dir)
-    return vector_store.similarity_search(question, k=k)
+    retrieved: list[dict] = []
+    for document, metadata, distance in zip(documents, metadatas, distances):
+        if not document or not metadata:
+            continue
+        retrieved.append({"text": document, "metadata": metadata, "distance": distance})
+    return retrieved
 
 
-def _format_context(documents: Iterable) -> str:
+def _format_context(documents: Iterable[dict]) -> str:
     parts: list[str] = []
     for index, document in enumerate(documents, start=1):
-        source = Path(document.metadata.get("source", "desconhecido")).name
-        page = document.metadata.get("page")
-        page_label = f", página {page + 1}" if isinstance(page, int) else ""
-        parts.append(
-            f"[Trecho {index} | {source}{page_label}]\n{document.page_content.strip()}"
-        )
+        metadata = document["metadata"]
+        source = Path(metadata.get("source", "desconhecido")).name
+        page = metadata.get("page")
+        page_label = f", página {page}" if isinstance(page, int) else ""
+        parts.append(f"[Trecho {index} | {source}{page_label}]\n{document['text'].strip()}")
     return "\n\n".join(parts)
 
 
@@ -197,19 +271,28 @@ Pergunta:
 """.strip()
 
 
-def _build_sources(documents: Iterable) -> list[RetrievedSource]:
+def _build_sources(documents: Iterable[dict]) -> list[RetrievedSource]:
     sources: list[RetrievedSource] = []
     for document in documents:
-        preview = " ".join(document.page_content.split())
+        metadata = document["metadata"]
+        preview = " ".join(document["text"].split())
         sources.append(
             RetrievedSource(
-                file_name=Path(document.metadata.get("source", "desconhecido")).name,
-                page=document.metadata.get("page"),
-                chunk_index=document.metadata.get("chunk_index", -1),
+                file_name=Path(metadata.get("source", "desconhecido")).name,
+                page=metadata.get("page"),
+                chunk_index=metadata.get("chunk_index", -1),
                 preview=preview[:180],
             )
         )
     return sources
+
+
+def _generate_answer(prompt: str) -> str:
+    genai = _configure_genai()
+    model = genai.GenerativeModel(CHAT_MODEL)
+    response = model.generate_content(prompt)
+    text = getattr(response, "text", "") or ""
+    return text.strip()
 
 
 def ask_question(question: str, db_dir: Path = DB_DIR, k: int = DEFAULT_K) -> AnswerResult:
@@ -224,15 +307,7 @@ def ask_question(question: str, db_dir: Path = DB_DIR, k: int = DEFAULT_K) -> An
             sources=[],
         )
 
-    _, _, ChatGoogleGenerativeAI, _, _ = _load_langchain_components()
-    llm = ChatGoogleGenerativeAI(
-        model=CHAT_MODEL,
-        google_api_key=get_google_api_key(),
-        temperature=0,
-    )
-    response = llm.invoke(_build_prompt(normalized_question, _format_context(documents)))
-    content = getattr(response, "content", response)
-    answer = content.strip() if isinstance(content, str) else str(content).strip()
+    answer = _generate_answer(_build_prompt(normalized_question, _format_context(documents)))
     if not answer:
         answer = "Não encontrei base suficiente nos documentos para responder com segurança."
 
