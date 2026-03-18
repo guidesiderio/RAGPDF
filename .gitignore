@@ -20,6 +20,7 @@ build/
 vector_store/
 chroma/
 .chroma/
+db/
 
 # Arquivos de ambiente e configuração
 .env
@@ -30,6 +31,7 @@ config.py
 # Logs e arquivos temporários
 *.log
 *.tmp
+tmp*/
 .DS_Store
 
 # Arquivos de IDE/editores
