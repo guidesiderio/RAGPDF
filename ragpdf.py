@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 from dataclasses import dataclass
@@ -162,16 +163,19 @@ def split_documents(
     for document_index, document in enumerate(documents):
         text_chunks = _split_text(document["text"], chunk_size=chunk_size, chunk_overlap=chunk_overlap)
         for local_chunk_index, chunk_text in enumerate(text_chunks):
+            metadata: dict = {
+                "source": document["source"],
+                "path": document["path"],
+                "page": document["page"],
+                "chunk_index": chunk_counter,
+            }
+            if "file_hash" in document:
+                metadata["file_hash"] = document["file_hash"]
             chunks.append(
                 IndexedChunk(
                     chunk_id=f"{document_index}-{local_chunk_index}",
                     text=chunk_text,
-                    metadata={
-                        "source": document["source"],
-                        "path": document["path"],
-                        "page": document["page"],
-                        "chunk_index": chunk_counter,
-                    },
+                    metadata=metadata,
                 )
             )
             chunk_counter += 1
@@ -180,11 +184,8 @@ def split_documents(
 
 def _embed_texts(texts: list[str]) -> list[list[float]]:
     genai = _configure_genai()
-    embeddings: list[list[float]] = []
-    for text in texts:
-        response = genai.embed_content(model=EMBEDDING_MODEL, content=text, task_type="retrieval_document")
-        embeddings.append(response["embedding"])
-    return embeddings
+    response = genai.embed_content(model=EMBEDDING_MODEL, content=texts, task_type="retrieval_document")
+    return response["embedding"]
 
 
 def _embed_query(text: str) -> list[float]:
@@ -198,16 +199,82 @@ def reset_vector_db(db_dir: Path = DB_DIR) -> None:
         shutil.rmtree(db_dir)
 
 
-def index_documents(base_dir: Path = BASE_DIR, db_dir: Path = DB_DIR) -> IndexResult:
-    documents = load_documents(base_dir)
+def _file_hash(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _indexed_hashes(db_dir: Path) -> dict[str, str]:
+    """Retorna {source_filename: file_hash} dos documentos já no DB."""
+    if not db_dir.exists():
+        return {}
+    collection = _get_chroma_collection(db_dir)
+    result = collection.get(include=["metadatas"])
+    hashes: dict[str, str] = {}
+    for meta in result.get("metadatas") or []:
+        if meta and "source" in meta and "file_hash" in meta:
+            hashes[meta["source"]] = meta["file_hash"]
+    return hashes
+
+
+def index_documents(base_dir: Path = BASE_DIR, db_dir: Path = DB_DIR, force: bool = False) -> IndexResult:
+    ensure_base_dir(base_dir)
+
+    pdf_paths = sorted(base_dir.rglob("*.pdf"))
+    current_hashes = {p.name: _file_hash(p) for p in pdf_paths}
+
+    stored_hashes: dict[str, str] = {}
+    pdfs_to_remove: set[str] = set()
+
+    if force:
+        reset_vector_db(db_dir)
+        pdfs_to_index = list(pdf_paths)
+    else:
+        stored_hashes = _indexed_hashes(db_dir)
+        stored_names = set(stored_hashes)
+        current_names = set(current_hashes)
+
+        pdfs_to_index = [p for p in pdf_paths if current_hashes[p.name] != stored_hashes.get(p.name)]
+        pdfs_to_remove = stored_names - current_names
+
+    db_dir.mkdir(parents=True, exist_ok=True)
+    collection = _get_chroma_collection(db_dir)
+
+    # Remove chunks de PDFs deletados ou modificados (somente no modo incremental)
+    sources_to_remove = pdfs_to_remove | {p.name for p in pdfs_to_index if p.name in stored_hashes}
+    if sources_to_remove:
+        existing = collection.get(include=["metadatas"])
+        ids_to_delete = [
+            eid
+            for eid, meta in zip(existing["ids"], existing.get("metadatas") or [])
+            if meta and meta.get("source") in sources_to_remove
+        ]
+        if ids_to_delete:
+            collection.delete(ids=ids_to_delete)
+
+    if not pdfs_to_index:
+        return IndexResult(documents_loaded=0, chunks_created=0, db_directory=db_dir)
+
+    # Carrega e indexa apenas os PDFs selecionados
+    _, _, PdfReader = _load_runtime_dependencies()
+    documents: list[dict] = []
+    for pdf_path in pdfs_to_index:
+        reader = PdfReader(str(pdf_path))
+        for page_number, page in enumerate(reader.pages, start=1):
+            text = (page.extract_text() or "").strip()
+            if not text:
+                continue
+            documents.append({
+                "source": pdf_path.name,
+                "path": str(pdf_path),
+                "page": page_number,
+                "text": text,
+                "file_hash": current_hashes[pdf_path.name],
+            })
+
     chunks = split_documents(documents)
     if not chunks:
         raise RAGPDFError("Os PDFs foram lidos, mas nenhum texto utilizável foi extraído para indexação.")
 
-    reset_vector_db(db_dir)
-    db_dir.mkdir(parents=True, exist_ok=True)
-
-    collection = _get_chroma_collection(db_dir)
     collection.add(
         ids=[chunk.chunk_id for chunk in chunks],
         documents=[chunk.text for chunk in chunks],
