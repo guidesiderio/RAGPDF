@@ -34,9 +34,10 @@ config.py
 tmp*/
 .DS_Store
 
-# Arquivos de IDE/editores
+# Arquivos de IDE/editores e ferramentas locais
 .vscode/
 .idea/
+.claude/
 *.swp
 *.swo
 *~
